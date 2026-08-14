@@ -1,66 +1,95 @@
+"""Configuration definitions for this assignment.
+
+Modify this file to set the allowed hyperparameters and options you believe are
+appropriate for your experiments.
+"""
+
 import argparse
 import dataclasses
 import json
 import os
 import sys
 import time
-from typing import List
+from typing import List, Optional, Tuple
 
 import utils
 
 
 @dataclasses.dataclass
 class Config:
-    """Configuration for model training with command-line argument parsing."""
+    """Configuration class for this assignment.
 
+    We will use Python dataclasses to define and manage all configuration parameters.
+
+    Usage:
+        >>> cfg = Configs()
+        >>> print(cfg.epochs)
+        100
+    """
     # yapf: disable
-    # ----------------------------------------
-    # Training configs
-    num_train_epochs: int = 10              # Total number of passes through the training dataset
-    per_device_train_batch_size: int = 4    # Number of training samples processed per GPU/CPU per step
-    per_device_eval_batch_size: int = 4     # Number of evaluation samples processed per GPU/CPU per step
-    learning_rate: float = 5e-5             # Step size for the optimizer (AdamW default for fine-tuning)
-    weight_decay: float = 0.01              # L2 regularization strength to reduce overfitting
-    warmup_ratio: float = 0.2               # Fraction of total steps used for linear LR warmup before decay
+    # ---------------------------------------- [you may modify this]
+    # DDPM hyperparameters
+    timesteps: int = 500  # Number of diffusion timesteps
+    beta_start: float = 0.0001  # Starting noise variance
+    beta_end: float = 0.02  # Ending noise variance
 
-    # Data configs
-    max_length: int = 1024                  # Maximum token sequence length; longer sequences are truncated
+    # Training hyperparameters
+    batch_size: int = 32  # Batch size
+    epochs: int = 300  # Number of training epochs
+    lr: float = 1e-4  # Learning rate
+    save_interval: int = 25  # Save checkpoint every N epochs
 
-    # Eval configs
-    eval_strategy: str = "epoch"            # When to run evaluation: "epoch" evaluates after each epoch ("steps" is the alternative)
-    eval_samples: int = 3                   # Number of text samples to generate and log during each evaluation
+    # Model architecture
+    time_emb_dim: Optional[int] = 128  # Time embedding dimension
+    text_emb_dim: Optional[int] = 384  # Text embedding dimension. Set to 384 for text conditioning, None for unconditional
+
+    # UNet architecture
+    block_out_ch: Tuple[int, ...] = (64, 128, 256)  # Number of output channels at each resolution level
+    num_layers_per_block: int = 2  # Number of convolutional layers in each UNet block
     # ----------------------------------------
     # yapf: enable
 
-    # Experiment configs
+    # Experiment settings
     run_id: str = f"{int(time.time() * 1000)}"
     quick_test: bool = False
-    hf_root_dir: str = "/mnt/hf_cache" if utils.is_cluster_node() else "a3/hf_cache"
-    ds_root_dir: str = "/mnt/code_cache" if utils.is_cluster_node() else "a3/code_cache"
+    hf_root_dir: str = "/mnt/hf_cache" if utils.is_cluster_node() else "a2/hf_cache"
 
-    # Data configs
-    data_dir: str = f"{ds_root_dir}/Python"
-    val_frac: float = 0.1
-    stride: int = 256
+    # Data parameters
+    dataset_name: str = f"{hf_root_dir}/datasets/valhalla/emoji-dataset"
+    img_size: int = 48
 
-    # Model configs
-    model_repo_id = "gpt2"
-    model_name: str = f"{hf_root_dir}/models/{model_repo_id}"
-
-    # Paths
-    output_dir: str = "a3/runs/{run_id}/model"
-    samples_path: str = "a3/runs/{run_id}/generations/{step}.json"
-    configs_path: str = "a3/runs/{run_id}/configs.json"
-
-    # Other settings
-    fp16: bool = False if str(utils.get_device()) == "mps" else True
-    seed: int = 42
-
-    # Generation config.
+    # Generation parameters
+    num_samples: int = 16
     sample_prompts: List[str] = dataclasses.field(default_factory=lambda: [
-        "def is_palindrome(head: ListNode | None) -> bool:\n    \"\"\"\n    Check if a linked list is a palindrome.\n    \"\"\"\n    if not head:\n        return True\n    # split the list to two parts\n    fast: ListNode | None = head.next_node\n    slow: ListNode | None = head\n    while fast and fast.next_node:\n        fast = fast.next_node.next_node\n        slow = slow.next_node if slow else None\n    if slow:",
+        'man bowing deeply with fairy wings', 'house building', 'male sleuth',
+        'woman judge with curly hair', 'pouting cat face', 'merwoman light skin tone',
+        'ferris wheel', 'man gesturing not ok with folded hands',
+        'older woman raising hand', 'adult fairy', 'male judge bowing deeply',
+        'older woman with fairy wings', 'shrugging fairy', 'mountain bicyclist',
+        'male judge', 'female mechanic'
     ])
 
+    # sample_prompts: List[str] = dataclasses.field(default_factory=lambda: [
+    #     'merman', 'john burtt, fluffy grey cat', 'happy cowboy', 'engineering student',
+    #     'sleeping guy', 'guy that is rock climbing', 'guy that is falling in the sky',
+    #     'astornaut on the moon', 'older man eating candy'
+    # ])
+
+    # Text encoding parameters
+    model_name: str = f"{hf_root_dir}/models/sentence-transformers/all-MiniLM-L6-v2"
+    max_length: int = 80
+
+    # Paths
+    checkpoint_path: str = "a2/runs/{run_id}/checkpoint.pth"
+    samples_path: str = "a2/runs/{run_id}/samples/{epoch}.png"
+    configs_path: str = "a2/runs/{run_id}/configs.json"
+
+    # UNet architecture
+    num_ch: int = 3
+    num_groups: int = 8
+
+    #
+    # Helper methods defined below.
     def get_path(self, key, **kwargs):
         if "run_id" not in kwargs:
             kwargs["run_id"] = self.run_id
@@ -79,7 +108,7 @@ class Config:
         parser.add_argument(
             "--run_id",
             type=str,
-            help="Only use for generation (using generate.py)",
+            help="Only use for inference (using infer.py)",
         )
         return parser.parse_args()
 
@@ -88,13 +117,15 @@ class Config:
         if args.quick_test or quick_test:
             self.quick_test = True
             self.run_id = "quick_test"
-            self.num_train_epochs = 1
-            self.eval_samples = 1
-            self.per_device_eval_batch_size = 1
-            self.test_samples = 16
-            self.max_length = 126
+            self.epochs = 1
+            self.batch_size = 4
+            self.block_out_ch = (2, 4)
+            self.num_layers_per_block = 1
+            self.timesteps = 10
+            self.save_interval = 1
+            self.num_groups = 2
 
-    def apply_generation_config(self):
+    def apply_infer_config(self):
         args = self.parse_args()
         if not args.run_id:
             raise ValueError(f"Need pass run_id of trained model in '--args.run_id'")

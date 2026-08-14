@@ -1,343 +1,356 @@
-import math
-import sys
+"""This module contains classes for creating a UNet architecture for conditional DDPM."""
 
-from einops import rearrange
-from network_utils import BaseGPT2LMHeadModel
-from network_utils import GPT2ConfigHF
+import math
+from typing import Optional, Tuple, Union
+
+from configs import Config
 import torch
 import torch.nn as nn
+from torchinfo import summary
 from utils import not_implemented
 
 
-class MultiHeadAttention(nn.Module):
-    """Multi-head self-attention with causal masking.
-
+class TimestepEmbedding(nn.Module):
+    """Sinusoidal position embeddings for time steps.
+    
     Attributes:
-        head_dim: The dimension of a single attention head.
-        c_attn: Linear projection for generating query, key, and value vectors.
-        c_proj: Linear projection for the output of the attention heads.
-        attn_dropout: Dropout applied to the attention probabilities.
-        resid_dropout: Dropout applied to the final projected output.
-        bias: Buffer containing the causal mask to prevent attending to future tokens.
+        dim: Dimension of the embedding vector.
     """
 
-    def __init__(self, n_emb: int, n_head: int, n_pos: int, dropout: float):
-        """Initialize the Multi-head Attention module.
-
-        Args:
-            n_emb: The total embedding dimension of the input.
-            n_head: The number of parallel attention heads.
-            n_pos: The maximum sequence length used to pre-compute the causal mask.
-            dropout: The dropout probability.
-        """
+    def __init__(self, dim: int):
         super().__init__()
-        if n_emb % n_head != 0:
-            raise ValueError(f"Embedding dimension {n_emb} must be divisible by "
-                             f"number of heads {n_head}")
+        self.dim = dim
 
-        # Attention-related dimensions.
-        self.n_head = n_head
-        self.n_emb = n_emb
-        self.head_dim = n_emb // n_head
-
-        # Define linear projections for
-        # (1) queries, keys, and values
-        self.c_attn = nn.Linear(n_emb, 3 * n_emb)
-        # (2) outputs.
-        self.c_proj = nn.Linear(n_emb, n_emb)
-
-        # Initialize dropout for attention and residual connections.
-        self.attn_dropout = nn.Dropout(dropout)
-        self.resid_dropout = nn.Dropout(dropout)
-
-        # Build a lower-triangular mask to enforce causal attention.
-        mask = torch.tril(torch.ones(n_pos, n_pos))
-
-        bias = None
-        # ---------------------------------------- Part 1(b) [your code here]
-        # Build the causal bias matrix, where the attention is allowed set 1, else -inf
-        bias = torch.zeros_like(mask)
-        bias = bias.masked_fill(mask == 0, float('-inf'))
-        # ----------------------------------------
-
-        bias = rearrange(bias, 'i j -> 1 1 i j')
-        # Register the mask as a non-trainable buffer for device consistency.
-        # Important: Use bias as an instance variable in the code (self.bias)
-        self.register_buffer("bias", bias, persistent=False)
-
-    def forward(self, x: torch.Tensor):
-        """Apply multi-head self-attention with causal masking.
-
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        """Generate sinusoidal embeddings for input timesteps.
+        
         Args:
-            x: Input tensor of shape (batch_size, seq_len, n_emb)
-
+            time: Input timesteps of shape (batch_size,).
+            
         Returns:
-            Output tensor of shape (batch_size, seq_len, n_emb)
+            torch.Tensor: Sinusoidal embeddings of shape (batch_size, dim).
         """
-        B, T, C = x.size()
-        # ---------------------------------------- Part 1(b) [your code here]
-        # Project x into Q, K, V
-        qkv = self.c_attn(x)    # (B, T, 3C)
-        q, k, v = qkv.split(self.n_emb, dim=2)  # (B, T, C) each
+        half_dim = self.dim // 2
+        constant = math.log(10000) / (half_dim - 1)
+        # ---------------------------------------- Part 1(b)(i) [your code here]
+        i = torch.arange(half_dim, device=time.device) # tensor of indices
+        freq_vec = torch.exp(-i * constant) # frequency vector
 
-        # Reshape for multi-head attention
-        q = rearrange(q, 'b t (h d) -> b h t d', h=self.n_head)     # (B, H, T, dk)
-        k = rearrange(k, 'b t (h d) -> b h t d', h=self.n_head)     # (B, H, T, dk)
-        v = rearrange(v, 'b t (h d) -> b h t d', h=self.n_head)     # (B, H, T, dk)
+        scaled_t = time.unsqueeze(1) * freq_vec
 
-        # Compute A = softmax(QK^T / sqrt(d_k) + B) for each head
-        # A_scores = QK^T / sqrt(d_k)
-        # QK^T: (B, H, T, dk) * (B, H, dk, T) -> (B, H, T, T)
-        A_scores = q @ rearrange(k, 'b h t d -> b h d t') / math.sqrt(self.head_dim) + self.bias[:, :, :T, :T]
-        A_weights = torch.softmax(A_scores, dim=-1)
-        A_weights = self.attn_dropout(A_weights)
-
-        # Attend the values
-        y = A_weights @ v
-
-        # Merge heads and projects
-        y = rearrange(y, 'b h t d -> b t (h d)')
-        y = self.resid_dropout(self.c_proj(y))
-        return y
+        return torch.cat([torch.sin(scaled_t), torch.cos(scaled_t)], dim=1)
         # ----------------------------------------
 
 
-class MLP(nn.Module):
-    """Feed-forward network with GELU activation.
+class ResidualBlock(nn.Module):
+    """Residual block with time embedding and optional text conditioning"""
 
-    Attributes:
-        c_fc: Linear layer that expands the embedding dimension (n_emb -> 4 * n_emb).
-        c_proj: Linear layer that projects back to the embedding dimension (4 * n_emb -> n_emb).
-        dropout: Dropout layer applied to the output of the projection.
-        gelu: Gaussian Error Linear Unit activation function.
-    """
-
-    def __init__(self, n_emb: int, dropout: float):
-        """Initialize the MLP.
-
+    def __init__(self, in_ch: int, out_ch: int, cfg: Config):
+        """Initialize the ResidualBlock.
+        
         Args:
-            n_emb: The embedding dimension.
-            dropout: The dropout probability.
-        """
-        super().__init__()
-        self.c_fc = nn.Linear(n_emb, 4 * n_emb)
-        self.c_proj = nn.Linear(4 * n_emb, n_emb)
-        self.dropout = nn.Dropout(dropout)
-        self.gelu = nn.GELU()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply feed-forward transformation."""
-        # ---------------------------------------- Part 1(c)(i) [your code here]
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        # ----------------------------------------
-        return x
-
-
-class Block(nn.Module):
-    """Transformer block with pre-norm architecture.
-
-    Attributes:
-        ln_1: Layer normalization applied before self-attention.
-        attn: Multi-head self-attention module.
-        ln_2: Layer normalization applied before the feed-forward network.
-        mlp: Feed-forward neural network (MLP).
-    """
-
-    def __init__(self, n_emb: int, n_head: int, n_pos: int, dropout: float):
-        """Initialize the Block.
-
-        Args:
-            n_emb: The total embedding dimension of the input.
-            n_head: The number of parallel attention heads.
-            n_pos: The maximum sequence length used to pre-compute the causal mask.
-            dropout: The dropout probability.
-        """
-        super().__init__()
-        self.ln_1 = nn.LayerNorm(n_emb)
-        self.attn = MultiHeadAttention(n_emb, n_head, n_pos, dropout)
-        self.ln_2 = nn.LayerNorm(n_emb)
-        self.mlp = MLP(n_emb, dropout)
-
-    def forward(self, x: torch.Tensor):
-        """Apply attention and feed-forward with residual connections.
-
-        Args:
-             x: Input tensor.
-        """
-        # ---------------------------------------- Part 1(d)(i) [your code here]
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        # ----------------------------------------
-        return x
-
-
-class ReGPT2LMHeadModel(BaseGPT2LMHeadModel):
-    """Custom GPT-2 implementation.
-
-    Attributes:
-        wte: Embedding layer mapping tokens to dense vectors.
-        wpe: Embedding layer encoding positional information.
-        drop: Dropout applied to the combined token and position embeddings.
-        h: Stack of Transformer blocks.
-        ln_f: Final layer normalization applied after the last block.
-        lm_head: Linear projection from embeddings to vocabulary logits.
-    """
-
-    def __init__(self, cfg: GPT2ConfigHF):
-        """Initialize the model.
-
-        Args:
+            in_ch: Number of input channels.
+            out_ch: Number of output channels.
             cfg: Configuration object containing model hyperparameters.
         """
-        super().__init__(cfg)
-        self.cfg = cfg
+        super().__init__()
 
-        # Token embeddings (map tokens to dense vectors)
-        self.wte = nn.Embedding(cfg.vocab_size, cfg.n_embd)
-        # Position embeddings (encode information about the order of the words)
-        self.wpe = nn.Embedding(cfg.n_positions, cfg.n_embd)
-        self.drop = nn.Dropout(cfg.dropout)
+        self.time_mlp = None
+        time_emb_dim = cfg.time_emb_dim
+        if time_emb_dim:
+            self.time_mlp = nn.Linear(time_emb_dim, out_ch)
 
-        # Transformer blocks
-        args = [cfg.n_embd, cfg.n_head, cfg.n_positions, cfg.dropout]
-        self.h = nn.ModuleList([Block(*args) for _ in range(cfg.n_layer)])
+        self.text_mlp = None
+        text_emb_dim = cfg.text_emb_dim
+        if text_emb_dim:
+            self.text_mlp = nn.Sequential(nn.SiLU(), nn.Linear(text_emb_dim, out_ch))
 
-        # Final layer norm
-        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        self.block1 = nn.Sequential(
+            nn.GroupNorm(cfg.num_groups, in_ch),
+            nn.SiLU(),
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+        )
+        self.block2 = nn.Sequential(
+            nn.GroupNorm(cfg.num_groups, out_ch),
+            nn.SiLU(),
+            nn.Dropout(0.1),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+        )
 
-        # Language modeling head (project embeddings to vocabulary logits)
-        self.lm_head = nn.Linear(cfg.n_embd, cfg.vocab_size, bias=False)
-        # Weights tied with token embeddings (share parameters for efficiency)
-        self.lm_head.weight = self.wte.weight
-
-        # Initialize weights
-        self.post_init()
-        self.tie_weights()
-        self.total_params = sum(p.numel() for p in self.parameters())
+        if in_ch != out_ch:
+            self.shortcut = nn.Conv2d(in_ch, out_ch, 1)
+        else:
+            self.shortcut = nn.Identity()
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor = None,
-        labels: torch.Tensor = None,
-        **kwargs,
-    ) -> dict:
-        """Forward pass for causal language modeling.
-
+        x: torch.Tensor,
+        time_emb: Optional[torch.Tensor] = None,
+        text_context: Optional[torch.Tensor] = None,
+        return_intermediates: bool = False,
+    ):
+        """Forward pass through the residual block.
+        
         Args:
-            input_ids: Token IDs of shape (batch_size, seq_len)
-            attention_mask: Attention mask (unused in basic implementation)
-            labels: Labels for computing loss (same shape as input_ids)
-            **kwargs: Additional arguments (ignored)
-
+            x: Input tensor of shape (batch_size, in_ch, height, width).
+            time_emb: Time embedding tensor of shape (batch_size, time_emb_dim).
+            text_context: Text context tensor of shape (batch_size, text_emb_dim).
+            return_intermediates: If True, returns intermediate activations for analysis.
+            
         Returns:
-            Dictionary with 'loss', 'logits'
+            If return_intermediates is False:
+                torch.Tensor: Output tensor of shape (batch_size, out_ch, height, width).
+            If return_intermediates is True:
+                tuple: (output, h_after_block1, h_after_time_emb, h_after_text_emb).
         """
-        B, T = input_ids.size()
-        logits = None
-        # ---------------------------------------- Part 1(e)(ii) [your code here]
-        token_emb = self.wte(input_ids) 
-        position = torch.arange(T, device = input_ids.device)
-        position_emb = self.wpe(position)
-        x = self.drop(token_emb + position_emb)
+        h = self.block1(x)
+        h_after_block1 = h.clone() if return_intermediates else None
 
-        # pass through transformer blocks
-        for block in self.h:
-            x = block(x)
+        # Add time embedding
+        if time_emb is not None and self.time_mlp is not None:
+            # ---------------------------------------- Part 1(b)(ii) [your code here]
+            # format the projected time to add into h
+            projected_time_emb = self.time_mlp(time_emb) # [batch, out_ch]
+            projected_time_emb = projected_time_emb.unsqueeze(-1).unsqueeze(-1) # [batch, out_ch, 1, 1]
 
-        # final layer norm and project
-        x = self.ln_f(x)
-        logits = self.lm_head(x)
-        # ----------------------------------------
+            h = h + projected_time_emb
+            # ----------------------------------------
+        h_after_time_emb = h.clone() if return_intermediates else None
 
-        loss = None
-        if labels is not None:
-            # Shift for causal language modeling (predict next token)
-            shift_logits = logits[..., :-1, :]
-            shift_labels = labels[..., 1:]
-            shift_logits_flat = rearrange(shift_logits, 'b t v -> (b t) v')
-            shift_labels_flat = rearrange(shift_labels, 'b t -> (b t)')
-            loss = nn.functional.cross_entropy(shift_logits_flat, shift_labels_flat)
+        # Add text conditioning if available
+        if text_context is not None and self.text_mlp is not None:
+            # ---------------------------------------- Part 3(c) [your code here]
+            proj_text = self.text_mlp(text_context)
+            proj_text = proj_text.unsqueeze(-1).unsqueeze(-1) # (B, out_ch, 1, 1)
+            h = h + proj_text
+            # ----------------------------------------
+        h_after_text_emb = h.clone() if return_intermediates else None
 
-        result = {'loss': loss, 'logits': logits}
-        return result
+        h = self.block2(h)
+        if return_intermediates:
+            return (
+                h + self.shortcut(x),
+                h_after_block1,
+                h_after_time_emb,
+                h_after_text_emb,
+            )
+        return h + self.shortcut(x)
 
-    def _top_k_filter(self, logits, top_k):
-        top_k = min(top_k, logits.size(-1))
-        remove_mask = None
 
-        # Apply top-k filtering
-        # Hints: Use `torch.topk`. Create a boolean mask (`remove_mask`) for filtering.
-        # ---------------------------------------- Part 2(b)(iii) [your code here]
-        # Get the kth largest value for each item within the batch
-        threshold = torch.topk(logits, top_k, dim = -1).values[..., -1, None]
+class DownBlock(nn.Module):
+    """Downsampling block with residual layers"""
 
-        remove_mask = logits < threshold
-        # ----------------------------------------
+    def __init__(self, in_ch: int, out_ch: int, add_downsample: bool, cfg: Config):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            ResidualBlock(in_ch if i == 0 else out_ch, out_ch, cfg)
+            for i in range(cfg.num_layers_per_block)
+        ])
+        self.downsample = nn.MaxPool2d(2) if add_downsample else None
 
-        # Apply the mask to set removed tokens to negative infinity
-        logits = torch.where(remove_mask, torch.full_like(logits, float('-inf')),
-                             logits)
-        return logits
-
-    @torch.no_grad()
-    def generate(
+    def forward(
         self,
-        input_ids: torch.Tensor,
-        max_length: int = 50,
-        top_k: int = 0,
-        do_sample: bool = True,
-        eos_token_id: int = None,
+        x: torch.Tensor,
+        time_emb: Optional[torch.Tensor] = None,
+        text_embeds: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass through the down block."""
+        for resnet in self.resnets:
+            x = resnet(x, time_emb, text_embeds)
+        output_before_downsample = x
+        if self.downsample is not None:
+            x = self.downsample(x)
+        # The second output is used for skip connections in the decoder.
+        return x, output_before_downsample
+
+
+class UpBlock(nn.Module):
+    """Upsampling block with residual layers"""
+
+    def __init__(self, in_ch: int, out_ch: int, prev_out_ch: int, add_upsample: bool,
+                 cfg: Config):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            ResidualBlock(in_ch + prev_out_ch if i == 0 else out_ch, out_ch, cfg)
+            for i in range(cfg.num_layers_per_block)
+        ])
+        self.upsample = nn.Upsample(
+            scale_factor=2,
+            mode="bilinear",
+            align_corners=True,
+        ) if add_upsample else None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        skip_connection: torch.Tensor,
+        time_emb: Optional[torch.Tensor] = None,
+        text_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Generates text sequences autoregressively.
+        """Forward pass through the up block."""
+        x = torch.cat([x, skip_connection], dim=1)
+        for resnet in self.resnets:
+            x = resnet(x, time_emb, text_embeds)
+        if self.upsample is not None:
+            x = self.upsample(x)
+        return x
 
+
+class MidBlock(nn.Module):
+    """Middle block with residual layers"""
+
+    def __init__(self, in_ch: int, cfg: Config):
+        super().__init__()
+        self.resnets = nn.ModuleList([
+            ResidualBlock(in_ch=in_ch, out_ch=in_ch, cfg=cfg)
+            for _ in range(cfg.num_layers_per_block)
+        ])
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_emb: Optional[torch.Tensor] = None,
+        text_embeds: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass through the middle block."""
+        for resnet in self.resnets:
+            x = resnet(x, time_emb, text_embeds)
+        return x
+
+
+class UNet(nn.Module):
+    """U-Net architecture for Conditional DDPM.
+    
+    This U-Net implementation supports time conditioning and optional text conditioning
+    for DDPMs. It consists of an encoder (down blocks), bottleneck (middle block),
+    and decoder (up blocks) with skip connections.
+    
+    Attributes:
+        time_embedding: Sequential module for processing timestep embeddings.
+        conv_in: Initial convolutional layer.
+        down_blocks: ModuleList of DownBlock modules for the encoder path.
+        mid_block: MidBlock module for the bottleneck.
+        up_blocks: ModuleList of UpBlock modules for the decoder path.
+        conv_norm_out: Output GroupNorm layer.
+        conv_act: Output activation function (SiLU).
+        conv_out: Final convolutional layer to produce output.
+    """
+
+    def __init__(self, cfg: Config):
+        super().__init__()
+
+        time_emb_dim = cfg.time_emb_dim
+        self.time_embedding = None
+        if time_emb_dim:
+            self.time_embedding = nn.Sequential()
+            # ---------------------------------------- Part 1(b)(i) [your code here]
+            self.time_embedding.add_module("TimestepEmbedding", TimestepEmbedding(time_emb_dim))
+            # ----------------------------------------
+            self.time_embedding.add_module("linear_1",
+                                           nn.Linear(time_emb_dim, time_emb_dim * 2))
+            self.time_embedding.add_module("silu", nn.SiLU())
+            self.time_embedding.add_module("linear_2",
+                                           nn.Linear(time_emb_dim * 2, time_emb_dim))
+
+        num_ch = cfg.num_ch
+        block_out_ch = cfg.block_out_ch
+
+        # Initial convolution
+        self.conv_in = nn.Conv2d(num_ch, block_out_ch[0], 3, padding=1)
+
+        # Encoder (Down blocks)
+        self.down_blocks = nn.ModuleList([])
+        for i, block_ch in enumerate(block_out_ch):
+            is_final_block = i == len(block_out_ch) - 1
+            down_block = DownBlock(
+                in_ch=block_out_ch[i - 1] if i > 0 else block_out_ch[0],
+                out_ch=block_ch,
+                add_downsample=not is_final_block,
+                cfg=cfg,
+            )
+            self.down_blocks.append(down_block)
+
+        # Middle block
+        self.mid_block = MidBlock(in_ch=block_out_ch[-1], cfg=cfg)
+
+        # Decoder (Up blocks)
+        self.up_blocks = nn.ModuleList([])
+        rev_block_out_ch = list(reversed(block_out_ch))
+
+        for i, block_ch in enumerate(rev_block_out_ch):
+            is_final_block = i == len(block_out_ch) - 1
+            skip_ch = block_ch
+            up_block = UpBlock(
+                in_ch=block_ch,
+                out_ch=(rev_block_out_ch[i + 1] if i < len(rev_block_out_ch) -
+                        1 else block_out_ch[0]),
+                prev_out_ch=skip_ch,
+                add_upsample=not is_final_block,
+                cfg=cfg,
+            )
+            self.up_blocks.append(up_block)
+
+        # Output
+        self.conv_norm_out = nn.GroupNorm(cfg.num_groups, block_out_ch[0])
+        self.conv_act = nn.SiLU()
+        self.conv_out = nn.Conv2d(block_out_ch[0], num_ch, 3, padding=1)
+
+    def forward(
+        self,
+        sample: torch.FloatTensor,
+        timestep: Optional[Union[torch.Tensor, float, int]] = None,
+        txt_enc_hid: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Forward pass through the U-Net.
+        
         Args:
-            input_ids: Initial token indices of shape (batch_size, seq_len).
-            max_length: The maximum total length of the sequence to generate.
-            top_k: Limits sampling to the top k most probable tokens (0 to disable).
-            do_sample: If True, uses sampling; otherwise, uses greedy decoding.
-            eos_token_id: The token ID that signifies the end of a sequence.
-
+            sample: Noisy input tensor of shape (batch_size, num_ch, height, width).
+            timestep: Current diffusion timestep, can be a tensor, float, or int.
+            txt_enc_hid: Optional text encoder hidden states for conditioning,
+                shape (batch_size, seq_len, text_emb_dim).
+                
         Returns:
-            Generated token sequences of shape (batch_size, generated_length).
+            torch.Tensor: Predicted noise or denoised output of shape
+                (batch_size, num_ch, height, width).
         """
-        self.eval()
-        B, T = input_ids.size()
-        if not do_sample and top_k > 0:
-            raise ValueError("top_k requires do_sample=True.")
+        # Convert timestep to tensor if needed
+        time_emb = None
+        if timestep is not None and self.time_embedding is not None:
+            if isinstance(timestep, (float, int)):
+                timestep = torch.tensor([timestep], dtype=torch.long).to(sample.device)
+            time_emb = self.time_embedding(timestep)
 
-        for _ in range(max_length - T):
-            outputs = self.forward(input_ids)
-            logits = outputs['logits'][:, -1, :]
+        # Initial convolution
+        sample = self.conv_in(sample)
 
-            if top_k > 0:
-                logits = self._top_k_filter(logits, top_k)
+        # Encoder
+        down_block_res_samples = [sample]
+        for down_block in self.down_blocks:
+            sample, skip_sample = down_block(sample, time_emb, txt_enc_hid)
+            down_block_res_samples.append(skip_sample)
 
-            probs = torch.softmax(logits, dim=-1)
-            next_token = None
-            if do_sample:
-                # Sample the next token from the filtered probability distribution.
-                # Covers pure sampling, top-k
-                # ---------------------------------------- Part 2(b)(ii) [your code here]
-                next_token = torch.multinomial(probs, num_samples = 1)
-                # ----------------------------------------
-            else:
-                # For greedy decoding
-                # ---------------------------------------- Part 2(b)(i) [your code here]
-                next_token = torch.argmax(probs, dim = -1, keepdim = True)
-                # ----------------------------------------
+        # Middle
+        sample = self.mid_block(sample, time_emb, txt_enc_hid)
 
-            input_ids = torch.cat([input_ids, next_token], dim=1)
+        # Decoder
+        for up_block in self.up_blocks:
+            res_samples = down_block_res_samples.pop()
+            sample = up_block(sample, res_samples, time_emb, txt_enc_hid)
 
-            # Stop if EOS token is generated for all sequences in batch
-            if eos_token_id is not None and (next_token == eos_token_id).all():
-                break
-
-        return input_ids
+        # Output
+        sample = self.conv_norm_out(sample)
+        sample = self.conv_act(sample)
+        sample = self.conv_out(sample)
+        return sample
 
 
 if __name__ == "__main__":
-    sys.exit("Intended for import.")
+    # Small model configuration
+    cfg = Config()
+    cfg.block_out_ch = (32, 64, 128)
+    model = UNet(cfg)
+
+    # ---------------------------------------- Part 1(a) [your code here]
+    # Summary of the UNet with an input shape of (batch_size=2, numer_of_channels=3, height=48, width=48) 
+    summary(model, input_shape = (2, 3, 48, 48))
+    # ----------------------------------------

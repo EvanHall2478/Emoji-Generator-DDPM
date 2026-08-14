@@ -3,20 +3,22 @@ import os
 import random
 import socket
 import sys
+import textwrap
 import traceback
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import transformers
 
 
 def get_device() -> torch.device:
-    """Determine the best available device for computation."""
     if torch.backends.mps.is_available():
         return torch.device("mps")
     elif torch.cuda.is_available():
         return torch.device("cuda")
-    return torch.device("cpu")
+    else:
+        return torch.device("cpu")
 
 
 def set_seeds(seed=42):
@@ -30,6 +32,35 @@ def set_seeds(seed=42):
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
     transformers.set_seed(seed)
+
+
+def count_trainable_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def plot_sample_grid(samples, prompts, samples_path):
+    """Create and save a grid of sample images"""
+    # Create grid
+    rows, cols = (4, 4)
+    fig, axes = plt.subplots(rows, cols, figsize=(6, 6))
+    axes = axes.flatten() if isinstance(axes, np.ndarray) else [axes]
+
+    for i, ax in enumerate(axes):
+        if i < len(samples):
+            img = (samples[i].cpu().permute(1, 2, 0) + 1) / 2
+            img = torch.clamp(img, 0, 1)
+            ax.imshow(img)
+            ax.axis('off')
+            title = prompts[i] if prompts else f"Sample {i+1}"
+            wrapped_title = "\n".join(textwrap.wrap(title, 22))
+            ax.set_title(wrapped_title, fontsize=7)
+        else:
+            ax.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(samples_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Samples saved to: {samples_path}")
 
 
 def is_cluster_node():

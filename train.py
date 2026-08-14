@@ -1,194 +1,256 @@
-#!/usr/bin/env python3
-"""Training script."""
+from typing import Annotated, List, Optional, Tuple
 
-import json
-import random
-
-import configs
-from dataset import CodeDataset
-from einops import rearrange
-from generate import generate_completion
+from configs import Config
+import dataset as dataset_lib
+import einops
+import matplotlib.pyplot as plt
 import network
+import numpy as np
+import text_encoder
 import torch
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-import transformers
 import utils
 from utils import not_implemented
 
-
-def preprocess_logits_for_metrics(logits, labels):
-    """Convert logits to predictions to save memory."""
-    return torch.argmax(logits, dim=-1)
+Tensor4D = Annotated[torch.Tensor, ("batch", "channels", "height", "width")]
+Tensor1D = Annotated[torch.Tensor, ("batch",)]
 
 
-def compute_metrics(eval_pred):
-    """Compute token accuracy from predictions."""
-    preds, labels = eval_pred
-    shift_preds = rearrange(preds[..., :-1], 'b t -> (b t)')
-    shift_labels = rearrange(labels[..., 1:], 'b t -> (b t)')
-    correct = (shift_preds == shift_labels).sum()
-    total = len(shift_labels)
-    accuracy = (correct / total).item() if total > 0 else 0.0
-    return {'token_accuracy': accuracy}
+class DDPM:
+    """Denoising Diffusion Probabilistic Model with Text Conditioning"""
 
-
-class CodeGenerationCallback(transformers.TrainerCallback):
-    """Callback that generates and saves sample completions after each eval step."""
-
-    _PROMPT_FRACTION = 0.3
-
-    def __init__(
-        self,
-        tokenizer: transformers.GPT2Tokenizer,
-        eval_dataset: CodeDataset,
-        cfg: configs.Config,
-        seed: int = 42,
-    ):
-        self.tokenizer = tokenizer
-        self.eval_dataset = eval_dataset
+    def __init__(self, cfg: Config):
+        """Initialize DDPM with configuration object"""
         self.cfg = cfg
-        self.seed = seed
+        self.device = utils.get_device()
 
-    def on_evaluate(self, args, state, control, model, **kwargs):
-        """Called by the Trainer after each evaluation phase."""
-        step = state.global_step or 0
-        output_path = self.cfg.get_path("samples_path", step=step)
-        device = utils.get_device()
+        # Initialize variables for model and text encoder which will be populated
+        # later.
+        self.model = None
+        self.text_encoder = None
 
-        model.eval()
-        model.to(device)
+        # Compute all noise schedule parameters at once
+        self._setup_noise_schedule()
 
-        prompts = self._prepare_prompts(self.cfg.eval_samples)
-        results = self._generate(model, prompts, device)
+    def _setup_noise_schedule(self):
+        """Setup linear noise schedule and precompute all necessary values"""
+        # Linear beta schedule
+        self.betas = torch.linspace(
+            start=self.cfg.beta_start,
+            end=self.cfg.beta_end,
+            steps=self.cfg.timesteps,
+        ).to(self.device)
 
-        self._print_preview(results, step)
-        self._save(results, output_path)
-        print(f"Generation(s) for step {step} saved to {output_path}.")
+        # ---------------------------------------- Part 2(a) [your code here]
+        alphas = 1.0 - self.betas
+        self.alphas_cumprod = torch.cumprod(alphas, dim=0)
+        self.alphas_cumprod_prev = F.pad(self.alphas_cumprod[:-1], (1,0), value=1.0)
+        self.sqrt_alphas_cumprod = torch.sqrt(self.alphas_cumprod)
+        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - self.alphas_cumprod)
 
-    def _prepare_prompts(self, num_samples: int) -> list:
-        """Return a fixed random selection of prompts from the eval dataset."""
-        rng = random.Random(self.seed)
-        indices = rng.sample(range(len(self.eval_dataset)),
-                             min(num_samples, len(self.eval_dataset)))
+        # posterior_variance = Beta_t * (1 - alpha_(t-1)) / (1 - alpha_t)
+        self.posterior_variance = self.betas * (1.0 - self.alphas_cumprod_prev) / (1.0 - self.alphas_cumprod)
+        # ----------------------------------------
 
-        prompts = []
-        for sample_id, idx in enumerate(indices, start=1):
-            clean_ids = self._clean_token_ids(self.eval_dataset[idx]['input_ids'])
-            split = int(len(clean_ids) * self._PROMPT_FRACTION)
-            prompt_text = self.tokenizer.decode(clean_ids[:split],
-                                                skip_special_tokens=True)
-            full_text = self.tokenizer.decode(clean_ids, skip_special_tokens=True)
-            prompts.append({
-                "prompt": prompt_text,
-                "metadata": {
-                    "sample_id": sample_id,
-                    "dataset_index": idx,
-                    "reference": full_text,
-                },
-            })
-        return prompts
+    def set_model(self, model):
+        self.model = model
+        print(f"UNet parameter count: {utils.count_trainable_parameters(model)}")
 
-    def _clean_token_ids(self, token_ids: list) -> list:
-        """Strip padding and special tokens from a token-id sequence."""
-        pad = self.tokenizer.pad_token_id
-        special = self.tokenizer.all_special_ids
-        return [t for t in token_ids if t != pad and t not in special]
+    def set_text_encoder(self, text_encoder):
+        self.text_encoder = text_encoder
 
-    def _generate(self, model, prompts: list, device: torch.device) -> list:
-        """Run greedy generation for every prompt using generate_completion."""
-        results = []
-        for entry in tqdm(prompts, desc="Generating samples", ncols=100):
-            generated_text = generate_completion(
-                model,
-                self.tokenizer,
-                entry["prompt"],
-                self.eval_dataset.max_length,
-                device,
-            )
-            results.append({
-                "prompt": entry["prompt"],
-                "generated": generated_text,
-                **entry["metadata"],
-            })
-        return results
+    @staticmethod
+    def expand(tensor: Tensor1D) -> Tensor4D:
+        """Expand a 1D batch tensor into a 4D tensor for broadcasting."""
+        return einops.rearrange(tensor, 'b -> b 1 1 1')
 
-    def _print_preview(self, results: list, step: int):
-        """Print a compact console preview of the generated samples."""
-        print("\n\n" + "-" * 88)
-        print(f"Code generation preview  (step {step})")
-        for result in results:
-            print("\n" + "-" * 22 + f" [Sample {result['sample_id']}]"
-                  f"  (dataset index {result['dataset_index']})")
-            print(f"    PROMPT     :{result['prompt']}")
-            print(f"    GENERATED  :{result['generated']}")
-        print("-" * 88)
+    def q_sample(self, x: Tensor4D, t: Tensor1D, noise: Tensor4D) -> Tensor4D:
+        """Sample from q(z_t | x)."""
+        # ---------------------------------------- Part 2(b) [your code here]
+        # implement z_t = sqrt(alphas_t) * x + sqrt(1-alphas_t) * epsilon
+        sqrt_alphas_cumprod_t = self.expand(self.sqrt_alphas_cumprod[t])
+        sqrt_one_minus_alphas_cumprod_t = self.expand(self.sqrt_one_minus_alphas_cumprod[t])
 
-    def _save(self, results: list, output_path: str):
-        """Serialise generation results to a JSON file."""
-        with open(output_path, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2)
+        return sqrt_alphas_cumprod_t * x + sqrt_one_minus_alphas_cumprod_t * noise
+        # ----------------------------------------
+
+    @torch.no_grad()
+    def p_sample(
+        self,
+        z_t: Tensor4D,
+        t: Tensor1D,
+        t_index: int,
+        text_embeds: Optional[Tensor4D] = None,
+    ) -> Tensor4D:
+        """Sample from p(z_{t-1} | z_t) with text conditioning"""
+        # ---------------------------------------- Part 2(d) [your code here]
+        # z_(t-1) = 1/sqrt(alpha_t) * (z_t - (betas_t) / (sqrt(1 - alphas_t)) * epsilon(z_t, t)) + sigma_t * epsilon
+        # sigma_t is the sqrt posterior variance, epsilon(z_t, t) is the models predictd noise, epsilon is the noise
+        betas_t = self.expand(self.betas[t])
+        sqrt_one_minus_alphas_cumprod_t = self.expand(self.sqrt_one_minus_alphas_cumprod[t])
+        alphas = 1.0 - self.betas
+        sqrt_recip_alphas_t = self.expand(1.0 / torch.sqrt(alphas[t]))
+
+        pred_noise = self.model(z_t, t, text_embeds)
+
+        model_mean = sqrt_recip_alphas_t * (z_t - betas_t * pred_noise / sqrt_one_minus_alphas_cumprod_t)
+
+        # posterior variance ~= 0 at t_index == 0
+        if t_index == 0:
+            return model_mean
+        else:
+            self.posterior_variance_t = self.expand(self.posterior_variance[t])
+            noise = torch.randn_like(z_t)
+            return model_mean + torch.sqrt(self.posterior_variance_t) * noise
+        # ----------------------------------------
+
+    @torch.no_grad()
+    def sample(
+        self,
+        shape: Tuple[int, int, int, int],
+        prompts: Optional[List[str]] = None,
+    ) -> Tensor4D:
+        """Generate samples conditioned on text prompts"""
+        # Encode text prompts
+        if prompts:
+            text_embeds = self.text_encoder.encode(prompts)
+        else:
+            text_embeds = None
+
+        # 1. Start with Gaussian noise tensor of given `shape`.
+        # 2. Iterate from T - 1 to 0 to call `self.p_sample` with appropriate
+        #   parameters.
+        # 3. Return the final denoised image.
+        # ---------------------------------------- Part 2(e) [your code here]
+        z_T = torch.randn(shape, device=self.device)
+
+        # Iterate from T-1 to 0
+        for t_index in reversed(range(self.cfg.timesteps)):
+            t = torch.full((shape[0],), t_index, device=self.device, dtype=torch.long)
+            z_T = self.p_sample(z_T, t, t_index, text_embeds)
+        return z_T
+        # ----------------------------------------
+
+
+def train_ddpm(cfg: Config):
+    """Train the DDPM model using configuration"""
+    print(f"Experiment: {cfg.run_id}")
+
+    # Setup device
+    device = utils.get_device()
+    print(f"Using device: {device}")
+
+
+    # Dataset and dataloader
+    dataset = dataset_lib.EmojiDataset(cfg)
+    dataloader = DataLoader(
+        dataset,
+        batch_size=cfg.batch_size,
+        shuffle=True,
+    )
+
+    # Initialize DDPM first.
+    ddpm_scheduler = DDPM(cfg)
+
+    # Initialize the model
+    model = network.UNet(cfg).to(device)
+    ddpm_scheduler.set_model(model)
+
+    text_enc = None
+    if cfg.text_emb_dim:
+        text_enc = text_encoder.TextEncoder(cfg)
+        ddpm_scheduler.set_text_encoder(text_enc)
+
+    # Optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
+
+    # Training loop
+    model.train()
+    text_embeds = None
+    for epoch in range(cfg.epochs):
+        total_loss = 0
+
+        pbar = tqdm(dataloader, desc=f'Epoch {epoch+1}/{cfg.epochs}')
+        for images, texts in pbar:
+            images = images.to(device)
+
+            # Use the text encoder to get embeddings for the `texts` batch.
+            # This operation must be wrapped in a `torch.no_grad()` context manager
+            # because the text encoder is frozen and we don't need to compute its gradients.
+            if text_enc is not None:
+                # ---------------------------------------- Part 3(b) [your code here]
+                with torch.no_grad():
+                    text_embeds = text_enc.encode(texts)
+                # ----------------------------------------
+
+            # Create time steps tensor
+            # ---------------------------------------- Part 2(c)(i) [your code here]
+            t = torch.randint(0, cfg.timesteps, (images.shape[0],), device=device)
+            # ----------------------------------------
+
+            # Calculate the loss for the model.
+            # ---------------------------------------- Part 2(c)(ii-v) [your code here]
+            # Initialize noise used within the model
+            noise = torch.randn_like(images)
+            x_noisy = ddpm_scheduler.q_sample(images, t, noise)
+
+            predicted_noise = model(x_noisy, t, text_embeds)
+            loss = F.mse_loss(predicted_noise, noise)
+            # ----------------------------------------
+
+            # The standard PyTorch backward pass and optimization.
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item()
+            pbar.set_postfix({'Loss': f'{loss.item():.4f}'})
+        pbar.close()
+
+        avg_loss = total_loss / len(dataloader)
+        print(f'Epoch {epoch + 1} - Average Loss: {avg_loss:.4f}')
+
+        # Save model and generate samples
+        if (epoch + 1) % cfg.save_interval == 0 or (epoch + 1) == cfg.epochs:
+            # Save model
+            model_path = cfg.get_path("checkpoint_path", epoch=epoch + 1)
+            torch.save(model.state_dict(), model_path)
+            print(f"Model saved to: {model_path}")
+            # Generate and save samples
+            save_samples(ddpm_scheduler, cfg, epoch + 1)
+
+    return model_path
+
+
+def save_samples(ddpm_scheduler: DDPM, cfg: Config, epoch: int):
+    """Generate and save sample images with text conditioning"""
+    prompts = cfg.sample_prompts if cfg.text_emb_dim else None
+
+    # Generate samples
+    ddpm_scheduler.model.eval()
+    img_size = cfg.img_size
+    batch_size = cfg.num_samples
+    with torch.no_grad():
+        samples = ddpm_scheduler.sample((batch_size, 3, img_size, img_size), prompts)
+    ddpm_scheduler.model.train()
+
+    # Save as grid
+    samples_path = cfg.get_path("samples_path", epoch=epoch)
+    utils.plot_sample_grid(samples, prompts, samples_path)
 
 
 def main():
-    """Main training function."""
-    cfg = configs.Config()
+    cfg = Config()
     cfg.apply_quick_test_config()
     cfg.save()
 
-    utils.set_seeds()
-    print(f"Run ID: {cfg.run_id}")
-
-    model_name = cfg.get_path("model_name")
-    print(f"Loading tokenizer and model from {model_name}")
-    tokenizer = transformers.GPT2Tokenizer.from_pretrained(model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    device = utils.get_device()
-    model = network.ReGPT2LMHeadModel.from_pretrained(model_name).to(device)
-    print(f"Total parameters: {model.total_params / 1e6:.2f}M")
-
-    train_dataset = CodeDataset(tokenizer=tokenizer, split='train', cfg=cfg)
-    eval_dataset = CodeDataset(tokenizer=tokenizer, split='validation', cfg=cfg)
-    print(f"Train dataset size: {len(train_dataset)}")
-    print(f"Validation dataset size: {len(eval_dataset)}")
-
-    output_dir = cfg.get_path("output_dir")
-    training_args = transformers.TrainingArguments(
-        output_dir=output_dir,
-        num_train_epochs=cfg.num_train_epochs,
-        per_device_train_batch_size=cfg.per_device_train_batch_size,
-        per_device_eval_batch_size=cfg.per_device_eval_batch_size,
-        learning_rate=cfg.learning_rate,
-        warmup_ratio=cfg.warmup_ratio,
-        weight_decay=cfg.weight_decay,
-        eval_strategy=cfg.eval_strategy,
-        save_strategy="no",
-        fp16=cfg.fp16,
-        seed=cfg.seed,
-        load_best_model_at_end=False,
-    )
-
-    trainer = transformers.Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        processing_class=tokenizer,
-        callbacks=[CodeGenerationCallback(tokenizer, eval_dataset, cfg)],
-        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
-        compute_metrics=compute_metrics,
-    )
-
-    print("Starting fine-tuning")
-    # ---------------------------------------- Part 3(a) [your code here]
-    trainer.train()
-    # ----------------------------------------
-
-    model.half().save_pretrained(output_dir)
-    tokenizer.save_pretrained(output_dir)
-    print(f"Model saved to {output_dir}")
+    print("Starting training...")
+    train_ddpm(cfg)
 
 
+# Example usage with configurations
 if __name__ == "__main__":
     main()
